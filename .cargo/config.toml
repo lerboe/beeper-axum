@@ -1,0 +1,5 @@
+[target.x86_64-unknown-linux-gnu]
+runner = "sudo --preserve-env=RUST_LOG"
+
+[env]
+RUST_TEST_THREADS = "1"
