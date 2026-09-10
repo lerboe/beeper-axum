@@ -36,7 +36,39 @@ volatile const u32 port;
 // userspace before the program is attached.
 #define MAX_ROUTES 16
 #define MAX_ROUTE_PATH 64
-#define MAX_ROUTE_BODY 32768
+
+// The most bytes the fast path adds to or reads from a message in one go.
+//
+// Both halves of serving a response are bounded by it. `bpf_msg_push_data`
+// backs every call with a single contiguous allocation taken from an atomic
+// context, which fails for all but the smallest orders, and the verifier
+// refuses any packet offset past `MAX_PACKET_OFF` (64K), which is as far into a
+// message as it can be addressed. A chunk is exactly one scatterlist element,
+// so pulling one back in never has to linearize anything either.
+#define CHUNK 32768
+
+// The most chunks a response is built from. A message holds `MAX_MSG_FRAGS`
+// (17) scatterlist elements, a couple of which the request itself takes up.
+#define MAX_CHUNKS 14
+
+#define MAX_ROUTE_BODY (MAX_CHUNKS * CHUNK)
+
+// The most stream ids a response carries, one per frame. An HTTP/2 body is
+// split across as many DATA frames as its peer's SETTINGS_MAX_FRAME_SIZE
+// allows, and every one of their headers names the stream it belongs to.
+#define MAX_SID_OFFS 32
+
+// The address the arena holding the pre-rendered responses is mapped at, and
+// how far it reaches. Naming the address rather than letting mmap pick one is
+// what lets an offset mean the same thing here and in user space.
+//
+// The reach is the most the routing table could ever need. Nothing is spent on
+// it up front: a page of an arena is only allocated once it is written to, and
+// user space shrinks the map to the routes it actually configured.
+#define ARENA_BASE (1ull << 44)
+#define ARENA_PAGES (MAX_ROUTES * 2 * MAX_ROUTE_BODY / 4096)
+
+#define __arena __attribute__((address_space(1)))
 
 // The matches the parsers are configured with, in the order in which user
 // space captures them.
@@ -119,16 +151,50 @@ struct {
     __type(value, struct dt_sync_buf);
 } dt_sync_scratch SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARENA);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __uint(max_entries, ARENA_PAGES);
+    __ulong(map_extra, ARENA_BASE);
+} arena SEC(".maps");
+
+// The program's handle on the arena. Referring to it is what ties the two
+// together, which is how the verifier knows where an arena address points, and
+// it is the only pointer into the arena the program is handed.
+//
+// It is a single byte: what user space writes into the arena has no shape the
+// program needs to know, as every response is found through the offset its
+// route carries, and declaring the whole run here would have libbpf write out
+// -- and so allocate -- all of it at load time.
+u8 __arena route_data[1];
+
+// The arena address `off` bytes into the responses.
+//
+// libbpf places a program's arena globals at the end of the arena, which is not
+// where user space lays the responses out, so `route_data` is only used to find
+// the arena's start again: an arena pointer is its offset into the arena, and
+// reading one back as an integer is what hands that offset over.
+static __always_inline const u8 __arena *arena_at(u32 off) {
+    u32 anchor = (u32)(unsigned long)route_data;
+
+    return route_data - anchor + off;
+}
+
+// A pre-rendered response, as a pair of offsets into the arena. The bodies
+// themselves live in the arena, so a route costs a handful of bytes here no
+// matter how large the file it answers with is.
 struct route {
     // the response rendered as HTTP/1.1
-    u8 body[MAX_ROUTE_BODY];
+    u32 body_off;
     u32 body_len;
 
-    // the same response rendered as an h2 HEADERS and DATA frame, along with
-    // the offsets of the stream ids in the two frame headers
-    u8 h2_body[MAX_ROUTE_BODY];
+    // the same response rendered as an h2 HEADERS frame followed by as many
+    // DATA frames as the body needs, along with the offsets of the stream ids
+    // in their frame headers
+    u32 h2_body_off;
     u32 h2_body_len;
-    u32 h2_sid_offs[2];
+    u32 h2_sid_offs[MAX_SID_OFFS];
+    u32 h2_sid_count;
 };
 
 struct route routes[MAX_ROUTES];
@@ -315,19 +381,45 @@ static __always_inline int prepend_dt_sync(struct sk_msg_md *msg, const struct i
 }
 
 // Writes `sid` into the frame header at `off`, where h2 keeps the stream id.
-static __always_inline int write_sid(u8 *data, u8 *data_end, u32 off, u32 sid) {
+//
+// The four bytes are pulled in on their own rather than reached through the
+// window the response was copied in: a response runs well past what a message
+// can be addressed through, and a frame header that sits near a chunk boundary
+// would otherwise be split across two of those windows.
+static __always_inline int write_sid(struct sk_msg_md *msg, u32 off, u32 sid) {
     if (off + 4 > MAX_ROUTE_BODY) return -1;
-    bpf_clamp_uminmax(off, 0, MAX_ROUTE_BODY - 4);
 
-    // the bound has to be established on the very pointer that is written
-    // through, deriving another one from `data` loses it again
-    u8 *p = data + off;
-    if (p + 4 > data_end) return -1;
+    if (bpf_msg_pull_data(msg, off, off + 4, 0) < 0) return -1;
 
-    p[0] = (sid >> 24) & 0xFF;
-    p[1] = (sid >> 16) & 0xFF;
-    p[2] = (sid >> 8) & 0xFF;
-    p[3] = sid & 0xFF;
+    u8 *data = (u8 *)(long)msg->data;
+    u8 *data_end = (u8 *)(long)msg->data_end;
+    if (data + 4 > data_end) return -1;
+
+    data[0] = (sid >> 24) & 0xFF;
+    data[1] = (sid >> 16) & 0xFF;
+    data[2] = (sid >> 8) & 0xFF;
+    data[3] = sid & 0xFF;
+
+    return 0;
+}
+
+// Copies `len` bytes of `src` into the message window that `bpf_msg_pull_data`
+// last made addressable. Returns 0 on success, < 0 if the window is short.
+static __always_inline int copy_chunk(struct sk_msg_md *msg, const u8 __arena *src, u32 len) {
+    u8 *data = (u8 *)(long)msg->data;
+    u8 *data_end = (u8 *)(long)msg->data_end;
+
+    // a helper cannot write into a message, so the copy is spelled out. `len`
+    // bounds it, the packet check is what the verifier goes by. the read side
+    // needs no bound of its own, as an arena access that lands outside the
+    // arena is caught rather than allowed to wander.
+    u32 k;
+    bpf_for(k, 0, CHUNK) {
+        if (k >= len) break;
+        if (data + k + 1 > data_end) return -1;
+
+        data[k] = src[k];
+    }
 
     return 0;
 }
@@ -343,34 +435,57 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
 
     u32 orig_size = msg->size;
 
+    // the message has to end up holding exactly the response. growing it goes
+    // a chunk at a time, as a single push of the whole difference asks the
+    // allocator for one contiguous block of it.
     if (body_len > orig_size) {
-        if (bpf_msg_push_data(msg, orig_size, body_len - orig_size, 0) < 0) return -1;
+        u32 i;
+        bpf_for(i, 0, MAX_CHUNKS) {
+            u32 size = msg->size;
+            if (size >= body_len) break;
+
+            u32 grow = body_len - size;
+            if (grow > CHUNK) grow = CHUNK;
+
+            if (bpf_msg_push_data(msg, size, grow, 0) < 0) return -1;
+        }
+
+        if (msg->size != body_len) return -1;
     } else if (body_len < orig_size) {
         if (bpf_msg_pop_data(msg, body_len, orig_size - body_len, 0) < 0) return -1;
     }
 
-    if (bpf_msg_pull_data(msg, 0, body_len, 0) < 0) return -1;
+    // the response is copied in one window at a time, each of which is pulled
+    // in on its own. a window is what the push above made one scatterlist
+    // element, so pulling it is free, and `msg->data` is rebased to its start,
+    // which keeps every offset the verifier sees well under `MAX_PACKET_OFF`.
+    u32 c;
+    bpf_for(c, 0, MAX_CHUNKS) {
+        u32 off = c * CHUNK;
+        if (off >= body_len) break;
 
-    u8 *data = (u8 *)(long)msg->data;
-    u8 *data_end = (u8 *)(long)msg->data_end;
+        u32 len = body_len - off;
+        if (len > CHUNK) len = CHUNK;
 
-    // after the push/pop above, the message is exactly `body_len` bytes, so
-    // the packet bound check below is sufficient on its own to stop the copy
-    // at the right place.
-    u32 k;
-    bpf_for(k, 0, MAX_ROUTE_BODY) {
-        if (data + k + 1 > data_end) break;
+        if (bpf_msg_pull_data(msg, off, off + len, 0) < 0) return -1;
 
-        u32 idx = k;
-        bpf_clamp_uminmax(idx, 0, MAX_ROUTE_BODY - 1);
-        data[k] = is_h2 ? r->h2_body[idx] : r->body[idx];
+        u32 body_off = is_h2 ? r->h2_body_off : r->body_off;
+
+        if (copy_chunk(msg, arena_at(body_off + off), len) < 0) return -1;
     }
 
     // the rendered frames carry a zeroed stream id, the one of the request
     // this responds to is only known here
     if (is_h2) {
-        if (write_sid(data, data_end, r->h2_sid_offs[0], sid) < 0) return -1;
-        if (write_sid(data, data_end, r->h2_sid_offs[1], sid) < 0) return -1;
+        u32 i;
+        bpf_for(i, 0, MAX_SID_OFFS) {
+            if (i >= r->h2_sid_count) break;
+
+            u32 j = i;
+            bpf_clamp_uminmax(j, 0, MAX_SID_OFFS - 1);
+
+            if (write_sid(msg, r->h2_sid_offs[j], sid) < 0) return -1;
+        }
     }
 
     if (bpf_msg_redirect_hash(msg, &sock_map, ikey, BPF_F_INGRESS) < 0) return -1;

@@ -30,7 +30,16 @@ fn huffman_encode(val: &str) -> Vec<u8> {
 // Must stay in sync with the corresponding `#define`s in fastpath.bpf.c.
 const MAX_ROUTES: usize = 16;
 const MAX_ROUTE_PATH: usize = 64;
-const MAX_ROUTE_BODY: usize = 32768;
+const CHUNK: usize = 32768;
+const MAX_CHUNKS: usize = 14;
+const MAX_ROUTE_BODY: usize = MAX_CHUNKS * CHUNK;
+const MAX_SID_OFFS: usize = 32;
+/// The smallest `SETTINGS_MAX_FRAME_SIZE` a peer may announce, and so the
+/// largest DATA frame that is safe to send without having seen its settings.
+const MAX_FRAME_SIZE: usize = 16384;
+
+const ARENA_BASE: usize = 1 << 44;
+const PAGE_SIZE: usize = 4096;
 
 /// The eBPF fast path of a server.
 ///
@@ -52,6 +61,23 @@ pub struct FastPath<'obj> {
 unsafe impl<'obj> Send for FastPath<'obj> {}
 
 unsafe impl<'obj> Sync for FastPath<'obj> {}
+
+/// The HTTP/2 rendering of a response, along with the offsets of the stream ids
+/// in its frame headers and the one it is placed at in the arena.
+struct H2Response {
+    body: Vec<u8>,
+    off: usize,
+    sid_offs: Vec<u32>,
+}
+
+/// A response rendered for every protocol the fast path can answer it on, ready
+/// to be loaded into the eBPF program.
+struct PreparedRoute {
+    keys: [Vec<u8>; 2],
+    body: Vec<u8>,
+    body_off: usize,
+    h2: Option<H2Response>,
+}
 
 /// Returns the value of the `Content-Type` header to serve `file` with, based
 /// on its extension.
@@ -106,9 +132,16 @@ fn h2_frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Renders the same response as [`render_response`] as an HTTP/2 HEADERS frame
-/// followed by a DATA frame. Both carry a zeroed stream id; the returned
-/// offsets point at the two spots the fast path has to patch it into.
-fn render_h2_response(file: &Path) -> Result<(Vec<u8>, [u32; 2])> {
+/// followed by as many DATA frames as the body needs. Every frame carries a
+/// zeroed stream id; the returned offsets point at the spots the fast path has
+/// to patch it into.
+///
+/// Flow control is not implemented. The fast path writes the whole response
+/// without consulting the peer's connection or stream window, and spends window
+/// that user-space `h2` never learns about, so a client's `WINDOW_UPDATE`s
+/// over-credit it by the same amount. Bodies past the 65535 byte default window
+/// only reach a client that announces a larger one.
+fn render_h2_response(file: &Path) -> Result<(Vec<u8>, Vec<u32>)> {
     let body = std::fs::read(file)
         .with_context(|| format!("failed to read fastpath asset {}", file.display()))?;
 
@@ -119,11 +152,29 @@ fn render_h2_response(file: &Path) -> Result<(Vec<u8>, [u32; 2])> {
     hdrs.extend_from_slice(&hpack_literal(31, content_type(file)));
 
     let mut resp = h2_frame(0x01, 0x04, &hdrs); // HEADERS, END_HEADERS
-    let data_off = resp.len();
-    resp.extend_from_slice(&h2_frame(0x00, 0x01, &body)); // DATA, END_STREAM
 
     // the stream id sits at offset 5 of a frame header
-    Ok((resp, [5, data_off as u32 + 5]))
+    let mut sid_offs = vec![5];
+
+    // an empty body still needs a frame of its own to carry END_STREAM, which
+    // is what `chunks` on its own would leave out
+    let empty: &[u8] = &[];
+    let chunks: Vec<&[u8]> = match body.is_empty() {
+        true => vec![empty],
+        false => body.chunks(MAX_FRAME_SIZE).collect(),
+    };
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let flags = match i + 1 == chunks.len() {
+            true => 0x01, // END_STREAM
+            false => 0x00,
+        };
+
+        sid_offs.push(resp.len() as u32 + 5);
+        resp.extend_from_slice(&h2_frame(0x00, flags, chunk));
+    }
+
+    Ok((resp, sid_offs))
 }
 
 impl<'obj> FastPath<'obj> {
@@ -149,26 +200,58 @@ impl<'obj> FastPath<'obj> {
         // a route is reachable under its plain text path as well as under the
         // huffman encoded one h2 puts on the wire
         let mut prepared = Vec::with_capacity(routes.len());
+        let mut arena_len = 0;
         for (path, file) in routes.iter() {
             let keys = [path.as_bytes().to_vec(), huffman_encode(path)];
             if keys.iter().any(|key| key.len() > MAX_ROUTE_PATH) {
                 bail!("fastpath route path `{path}` is longer than {MAX_ROUTE_PATH} bytes");
             }
 
-            let body = render_response(file)?;
-            let (h2_body, h2_sid_offs) = render_h2_response(file)?;
-
             // a response too large to pre-render is left to the server rather
             // than refused: a path the fast path does not know is one it passes
             // on, which is exactly what should happen to it
-            let len = body.len().max(h2_body.len());
-            if len > MAX_ROUTE_BODY {
+            let body = render_response(file)?;
+            if body.len() > MAX_ROUTE_BODY {
+                let len = body.len();
                 info!("Not serving `{path}` from the fast path, {len}B exceeds {MAX_ROUTE_BODY}B");
                 continue;
             }
 
+            let body_off = arena_len;
+            arena_len += body.len();
+
+            // the HTTP/2 rendering carries a frame header every
+            // `MAX_FRAME_SIZE` bytes, so it can outgrow the HTTP/1.1 one by
+            // enough to no longer fit
+            let (h2_body, sid_offs) = render_h2_response(file)?;
+            let fits = h2_body.len() <= MAX_ROUTE_BODY && sid_offs.len() <= MAX_SID_OFFS;
+            let h2 = match fits {
+                false => {
+                    let len = h2_body.len();
+                    info!(
+                        "Only serving `{path}` over HTTP/1.1, its {len}B HTTP/2 rendering does not fit"
+                    );
+                    None
+                }
+                true => {
+                    let off = arena_len;
+                    arena_len += h2_body.len();
+
+                    Some(H2Response {
+                        body: h2_body,
+                        off,
+                        sid_offs,
+                    })
+                }
+            };
+
             debug!("Serving `{path}` from the fast path");
-            prepared.push((keys, body, h2_body, h2_sid_offs));
+            prepared.push(PreparedRoute {
+                keys,
+                body,
+                body_off,
+                h2,
+            });
         }
 
         let address = address
@@ -193,22 +276,49 @@ impl<'obj> FastPath<'obj> {
         open_skel.maps.rodata_data.as_mut().unwrap().ip4 = ip4;
         open_skel.maps.rodata_data.as_mut().unwrap().port = address.port() as u32;
 
+        // the bodies go into the arena once it exists, all that is loaded here
+        // is where each of them will be found
         let bss = open_skel.maps.bss_data.as_mut().unwrap();
-        for (i, (_, body, h2_body, h2_sid_offs)) in prepared.iter().enumerate() {
+        for (i, PreparedRoute { body, body_off, h2, .. }) in prepared.iter().enumerate() {
             let route = &mut bss.routes[i];
-            route.body[..body.len()].copy_from_slice(body);
+            route.body_off = *body_off as u32;
             route.body_len = body.len() as u32;
-            route.h2_body[..h2_body.len()].copy_from_slice(h2_body);
-            route.h2_body_len = h2_body.len() as u32;
-            route.h2_sid_offs = *h2_sid_offs;
+
+            let Some(H2Response { body, off, sid_offs }) = h2 else {
+                continue;
+            };
+            route.h2_body_off = *off as u32;
+            route.h2_body_len = body.len() as u32;
+            route.h2_sid_offs[..sid_offs.len()].copy_from_slice(sid_offs);
+            route.h2_sid_count = sid_offs.len() as u32;
         }
+
+        // an arena is sized in pages, and only the ones the responses reach are
+        // ever backed by memory
+        let pages = arena_len.div_ceil(PAGE_SIZE).max(1);
+        open_skel.maps.arena.set_max_entries(pages as u32)?;
 
         let skel = open_skel.load()?;
         xbpf::tracing::try_init(skel.object())?;
 
+        // libbpf maps the arena where the program's `map_extra` asked for it,
+        // so a route's offset addresses the same bytes on both sides
+        let arena =
+            unsafe { std::slice::from_raw_parts_mut(ARENA_BASE as *mut u8, pages * PAGE_SIZE) };
+        for PreparedRoute { body, body_off, h2, .. } in prepared.iter() {
+            arena[*body_off..*body_off + body.len()].copy_from_slice(body);
+
+            let Some(H2Response { body, off, .. }) = h2 else {
+                continue;
+            };
+            arena[*off..*off + body.len()].copy_from_slice(body);
+        }
+
+        debug!("Loaded {arena_len}B of responses into a {pages} page arena");
+
         // the route index is a hash map, so it can only be populated once the
         // program is loaded and the map created
-        for (i, (keys, ..)) in prepared.iter().enumerate() {
+        for (i, PreparedRoute { keys, .. }) in prepared.iter().enumerate() {
             for key in keys {
                 let mut padded = [0; MAX_ROUTE_PATH];
                 padded[..key.len()].copy_from_slice(key);
