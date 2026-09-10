@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>beeper example</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+<header>
+<h1>beeper <span>example</span></h1>
+<p>
+A static file server whose small assets are answered from the kernel. Start it
+with <code>--with-ebpf</code> to attach the fast path; without it the same
+server runs as an ordinary axum application and every request is answered from
+user space.
+</p>
+<div class="meta">
+<div>served over <strong id="protocol">…</strong></div>
+<div id="summary">…</div>
+<div><button id="rerun" type="button">measure again</button></div>
+</div>
+</header>
+
+<h2>Assets</h2>
+<p>
+Each asset is fetched a few times and the median reported. The last column is
+where the response came from when the fast path is attached: the small ones fit
+the pre-rendered routing table, the images do not and are left to the server.
+</p>
+<table id="results">
+<thead>
+<tr>
+<th>path</th>
+<th>kind</th>
+<th>size</th>
+<th>median</th>
+<th>best</th>
+<th>served from</th>
+</tr>
+</thead>
+<tbody></tbody>
+</table>
+
+<h2>Images</h2>
+<p>
+These are here to give the page something worth loading. They are too large for
+the fast path's routing table, so they are always answered by the server.
+</p>
+<div class="gallery">
+<figure>
+<img src="/honeycomb.png" alt="A honeycomb pattern" width="480" height="320">
+<figcaption>/honeycomb.png</figcaption>
+</figure>
+<figure>
+<img src="/rings.png" alt="Concentric rings" width="600" height="400">
+<figcaption>/rings.png</figcaption>
+</figure>
+<figure>
+<img src="/stripes.png" alt="Diagonal stripes" width="640" height="420">
+<figcaption>/stripes.png</figcaption>
+</figure>
+</div>
+</main>
+
+<script src="/script.js"></script>
+</body>
+</html>

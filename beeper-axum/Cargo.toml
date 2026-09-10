@@ -1,0 +1,29 @@
+[package]
+name = "beeper-axum"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+beeper = { version = "0.1.2", features = ["h1", "h2"] }
+bytes = "1"
+# h2 is patched to allow beeper to modify the dynamic table
+h2 = "0.4.16"
+http = "1.5"
+http-body-util = "0.1"
+httlib-huffman = "0.3.4"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2.189"
+tokio = { version = "1.53", features = ["io-util", "net", "rt"] }
+tower = "0.5"
+tracing = "0.1.44"
+xbpf = "0.0.3"
+
+[build-dependencies]
+beeper = { version = "0.1.2", features = ["build"] }
+xbpf = { version = "0.0.3", features = ["build"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }

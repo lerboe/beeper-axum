@@ -1,0 +1,170 @@
+/* The example server's stylesheet. Small enough for the fast path to answer
+   it from the kernel, which is half the point of it being its own asset. */
+
+:root {
+    --bg: #12100b;
+    --panel: #1c1913;
+    --line: #322c20;
+    --ink: #f3ead7;
+    --dim: #a2977f;
+    --honey: #f5b301;
+    --cool: #6fa8dc;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 2.5rem 1.5rem 4rem;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+    max-width: 60rem;
+    margin: 0 auto;
+}
+
+header {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+h1 {
+    margin: 0 0 0.25rem;
+    font-size: 1.9rem;
+    letter-spacing: -0.02em;
+}
+
+h1 span {
+    color: var(--honey);
+}
+
+h2 {
+    font-size: 1.2rem;
+    margin: 2.5rem 0 0.75rem;
+}
+
+p {
+    margin: 0.5rem 0;
+    color: var(--dim);
+}
+
+code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    color: var(--ink);
+}
+
+.meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    margin-top: 1rem;
+    font-size: 0.9rem;
+}
+
+.meta div {
+    color: var(--dim);
+}
+
+.meta strong {
+    color: var(--ink);
+    font-weight: 600;
+}
+
+button {
+    font: inherit;
+    font-size: 0.9rem;
+    color: var(--bg);
+    background: var(--honey);
+    border: 0;
+    border-radius: 6px;
+    padding: 0.45rem 1rem;
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1rem;
+    font-size: 0.92rem;
+}
+
+th,
+td {
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+}
+
+th {
+    color: var(--dim);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+td.path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+td.fast {
+    color: var(--honey);
+}
+
+td.slow {
+    color: var(--cool);
+}
+
+td.bad {
+    color: #e06c75;
+}
+
+.gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+figure {
+    margin: 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+figure img {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+figcaption {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    color: var(--dim);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
