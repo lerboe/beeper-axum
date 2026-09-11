@@ -14,4 +14,4 @@ description = "Application-Layer Parsing in eBPF"
 categories = ["network-programming"]
 
 [patch.crates-io]
-h2 = { git = "https://github.com/lerboe/h2" }
+h2 = { path = "../h2" }

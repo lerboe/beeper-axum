@@ -434,7 +434,6 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "h2"
 version = "0.4.17"
-source = "git+https://github.com/lerboe/h2#c42705b11d83c3336667d54b30410272b671425e"
 dependencies = [
  "atomic-waker",
  "bytes",

@@ -13,6 +13,11 @@
 //! prime its decoder. Everything else is passed through untouched, so to the
 //! codec above it the stream looks like an ordinary connection.
 //!
+//! Frames of type [`FC_SYNC_FRAME_TYPE`] ride along the same way and are
+//! reported through a [`FlowHandle`]. They carry the number of bytes the fast
+//! path answered with, which the server has to take out of the send window its
+//! own codec believes it still has, see [`FlowHandle::take`].
+//!
 //! This mirrors the shape of `tokio_rustls`: the listener yields a stream that
 //! wraps the socket and quietly handles a protocol of its own underneath the
 //! one the caller speaks.
@@ -22,7 +27,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     task::{Context, Poll, ready},
 };
 use tokio::{
@@ -34,6 +42,13 @@ use tracing::{debug, warn};
 /// The frame type the fast path prepends its dynamic table changes under. Must
 /// stay in sync with `DT_SYNC_FRAME_TYPE` in `server.bpf.c`.
 const DT_SYNC_FRAME_TYPE: u8 = 0xFB;
+
+/// The frame type the fast path reports the bytes it answered with under. Must
+/// stay in sync with `FC_SYNC_FRAME_TYPE` in `server.bpf.c`.
+const FC_SYNC_FRAME_TYPE: u8 = 0xFA;
+
+/// The size of a flow control frame's body: one 32 bit count of bytes.
+const FC_SYNC_BODY_LEN: usize = 4;
 
 /// The HTTP/2 connection preface a client opens with, see section 3.5 of RFC
 /// 7540. Scanning only starts once it has been seen, so an HTTP/1.1 connection
@@ -88,6 +103,30 @@ impl SyncHandle {
     }
 }
 
+/// The bytes the fast path has answered with on a connection that the server's
+/// own codec has not been told about yet.
+///
+/// Those bytes were written straight onto the socket, so the client's
+/// connection level flow control window has already paid for them while `h2`
+/// still counts them as its to spend. The connection loop drains this and hands
+/// it to [`h2::server::Connection::consume_send_capacity`], which is what puts
+/// the two back in step.
+#[derive(Clone, Default)]
+pub struct FlowHandle {
+    sent: Arc<AtomicU32>,
+}
+
+impl FlowHandle {
+    /// Removes and returns the bytes reported so far.
+    pub fn take(&self) -> u32 {
+        self.sent.swap(0, Ordering::Relaxed)
+    }
+
+    fn add(&self, sent: u32) {
+        self.sent.fetch_add(sent, Ordering::Relaxed);
+    }
+}
+
 /// The protocol a connection turned out to speak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
@@ -114,6 +153,13 @@ enum State {
     /// stream rather than passed on.
     Sync { block: Vec<u8>, remaining: usize },
 
+    /// Collecting the payload of a flow control frame, which is taken out of
+    /// the stream the same way.
+    Flow {
+        buf: [u8; FC_SYNC_BODY_LEN],
+        got: usize,
+    },
+
     /// Not HTTP/2, or no longer able to follow the framing: everything from
     /// here on is passed through untouched.
     Blind,
@@ -132,20 +178,23 @@ struct Scanner {
     hold: VecDeque<u8>,
 
     sync: SyncHandle,
+    flow: FlowHandle,
 }
 
 impl Scanner {
-    fn new(sync: SyncHandle) -> Self {
+    fn new(sync: SyncHandle, flow: FlowHandle) -> Self {
         Self {
             state: State::Preface { matched: 0 },
             out: VecDeque::new(),
             hold: VecDeque::new(),
             sync,
+            flow,
         }
     }
 
-    /// Walks `input`, appending everything that is not a sync frame to `out`
-    /// and handing the sync frames it finds to the [`SyncHandle`].
+    /// Walks `input`, appending everything that is not one of the fast path's
+    /// own frames to `out` and handing the ones it finds to the [`SyncHandle`]
+    /// or the [`FlowHandle`] they belong to.
     ///
     /// Scanning stops at an update and the rest of `input` is held back, so
     /// that the request the update belongs to cannot reach the codec before
@@ -201,7 +250,20 @@ impl Scanner {
                     let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
                     let kind = buf[3];
 
-                    if kind != DT_SYNC_FRAME_TYPE {
+                    if kind == FC_SYNC_FRAME_TYPE {
+                        if len != FC_SYNC_BODY_LEN {
+                            warn!(
+                                "flow control frame of {len}B is not the expected \
+                                 {FC_SYNC_BODY_LEN}B, passing the connection through"
+                            );
+                            self.state = State::Blind;
+                        } else {
+                            self.state = State::Flow {
+                                buf: [0; FC_SYNC_BODY_LEN],
+                                got: 0,
+                            };
+                        }
+                    } else if kind != DT_SYNC_FRAME_TYPE {
                         let hdr = *buf;
                         self.out.extend(hdr.iter().copied());
                         self.state = State::Payload { remaining: len };
@@ -228,6 +290,21 @@ impl Scanner {
                     rest = &rest[n..];
 
                     if *remaining == 0 {
+                        self.state = State::header();
+                    }
+                }
+
+                State::Flow { buf, got } => {
+                    let n = (FC_SYNC_BODY_LEN - *got).min(rest.len());
+                    buf[*got..*got + n].copy_from_slice(&rest[..n]);
+                    *got += n;
+                    rest = &rest[n..];
+
+                    if *got == FC_SYNC_BODY_LEN {
+                        let sent = u32::from_be_bytes(*buf);
+                        debug!("received a report of {sent}B served out of band");
+
+                        self.flow.add(sent);
                         self.state = State::header();
                     }
                 }
@@ -277,6 +354,12 @@ impl BeeperStream {
     /// reported through.
     pub fn sync_handle(&self) -> SyncHandle {
         self.scanner.sync.clone()
+    }
+
+    /// Returns the handle the bytes the fast path answered with on this
+    /// connection are reported through.
+    pub fn flow_handle(&self) -> FlowHandle {
+        self.scanner.flow.clone()
     }
 
     /// Reads until the protocol the client speaks is known.
@@ -407,7 +490,7 @@ impl BeeperListener {
 
         let stream = BeeperStream {
             inner: stream,
-            scanner: Scanner::new(SyncHandle::default()),
+            scanner: Scanner::new(SyncHandle::default(), FlowHandle::default()),
         };
 
         Ok((stream, addr))
@@ -443,7 +526,7 @@ mod tests {
     /// on past the barrier.
     fn scan(chunks: &[&[u8]]) -> (Vec<u8>, Vec<Vec<u8>>) {
         let sync = SyncHandle::default();
-        let mut scanner = Scanner::new(sync.clone());
+        let mut scanner = Scanner::new(sync.clone(), FlowHandle::default());
         let mut blocks = Vec::new();
 
         for chunk in chunks {
@@ -529,6 +612,76 @@ mod tests {
 
         assert_eq!(out, expected);
         assert_eq!(blocks, vec![Vec::<u8>::new()]);
+    }
+
+    /// Feeds `chunks` through a scanner and returns what it passed on and the
+    /// bytes it was told the fast path answered with.
+    fn scan_flow(chunks: &[&[u8]]) -> (Vec<u8>, u32) {
+        let flow = FlowHandle::default();
+        let mut scanner = Scanner::new(SyncHandle::default(), flow.clone());
+
+        for chunk in chunks {
+            scanner.scan(chunk);
+        }
+
+        (scanner.out.into_iter().collect(), flow.take())
+    }
+
+    #[test]
+    fn takes_a_flow_control_frame_out_of_the_stream() {
+        let mut input = PREFACE.to_vec();
+        input.extend_from_slice(&frame(FC_SYNC_FRAME_TYPE, &4096u32.to_be_bytes()));
+        input.extend_from_slice(&frame(0x01, b"headers"));
+
+        let mut expected = PREFACE.to_vec();
+        expected.extend_from_slice(&frame(0x01, b"headers"));
+
+        let (out, sent) = scan_flow(&[&input]);
+
+        assert_eq!(out, expected);
+        assert_eq!(sent, 4096);
+    }
+
+    #[test]
+    fn finds_a_flow_control_frame_split_across_reads() {
+        let mut input = PREFACE.to_vec();
+        input.extend_from_slice(&frame(FC_SYNC_FRAME_TYPE, &4096u32.to_be_bytes()));
+        input.extend_from_slice(&frame(0x01, b"headers"));
+
+        let mut expected = PREFACE.to_vec();
+        expected.extend_from_slice(&frame(0x01, b"headers"));
+
+        let chunks: Vec<&[u8]> = input.chunks(1).collect();
+        let (out, sent) = scan_flow(&chunks);
+
+        assert_eq!(out, expected);
+        assert_eq!(sent, 4096);
+    }
+
+    #[test]
+    fn adds_up_the_flow_control_frames_of_a_connection() {
+        let mut input = PREFACE.to_vec();
+        input.extend_from_slice(&frame(FC_SYNC_FRAME_TYPE, &4096u32.to_be_bytes()));
+        input.extend_from_slice(&frame(0x01, b"headers"));
+        input.extend_from_slice(&frame(FC_SYNC_FRAME_TYPE, &128u32.to_be_bytes()));
+
+        let (_, sent) = scan_flow(&[&input]);
+
+        assert_eq!(sent, 4224);
+    }
+
+    #[test]
+    fn ignores_a_malformed_flow_control_frame() {
+        let mut input = PREFACE.to_vec();
+        input.extend_from_slice(&frame(FC_SYNC_FRAME_TYPE, b"not-a-count"));
+        input.extend_from_slice(&frame(0x01, b"headers"));
+
+        let (out, sent) = scan_flow(&[&input]);
+
+        // the framing cannot be trusted from here on, so scanning gives up and
+        // nothing else is taken out of the stream
+        assert!(out.ends_with(&frame(0x01, b"headers")));
+        assert_eq!(sent, 0);
     }
 
     #[test]

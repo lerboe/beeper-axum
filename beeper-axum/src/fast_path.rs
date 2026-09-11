@@ -68,6 +68,7 @@ struct H2Response {
     body: Vec<u8>,
     off: usize,
     sid_offs: Vec<u32>,
+    data_len: usize,
 }
 
 /// A response rendered for every protocol the fast path can answer it on, ready
@@ -136,12 +137,10 @@ fn h2_frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
 /// zeroed stream id; the returned offsets point at the spots the fast path has
 /// to patch it into.
 ///
-/// Flow control is not implemented. The fast path writes the whole response
-/// without consulting the peer's connection or stream window, and spends window
-/// that user-space `h2` never learns about, so a client's `WINDOW_UPDATE`s
-/// over-credit it by the same amount. Bodies past the 65535 byte default window
-/// only reach a client that announces a larger one.
-fn render_h2_response(file: &Path) -> Result<(Vec<u8>, Vec<u32>)> {
+/// The body's length is returned alongside them: it is the part of the response
+/// that is flow controlled, and so what the fast path has to have room for in
+/// the client's windows before it may answer with it.
+fn render_h2_response(file: &Path) -> Result<(Vec<u8>, Vec<u32>, usize)> {
     let body = std::fs::read(file)
         .with_context(|| format!("failed to read fastpath asset {}", file.display()))?;
 
@@ -174,7 +173,7 @@ fn render_h2_response(file: &Path) -> Result<(Vec<u8>, Vec<u32>)> {
         resp.extend_from_slice(&h2_frame(0x00, flags, chunk));
     }
 
-    Ok((resp, sid_offs))
+    Ok((resp, sid_offs, body.len()))
 }
 
 impl<'obj> FastPath<'obj> {
@@ -223,7 +222,7 @@ impl<'obj> FastPath<'obj> {
             // the HTTP/2 rendering carries a frame header every
             // `MAX_FRAME_SIZE` bytes, so it can outgrow the HTTP/1.1 one by
             // enough to no longer fit
-            let (h2_body, sid_offs) = render_h2_response(file)?;
+            let (h2_body, sid_offs, data_len) = render_h2_response(file)?;
             let fits = h2_body.len() <= MAX_ROUTE_BODY && sid_offs.len() <= MAX_SID_OFFS;
             let h2 = match fits {
                 false => {
@@ -241,6 +240,7 @@ impl<'obj> FastPath<'obj> {
                         body: h2_body,
                         off,
                         sid_offs,
+                        data_len,
                     })
                 }
             };
@@ -284,13 +284,14 @@ impl<'obj> FastPath<'obj> {
             route.body_off = *body_off as u32;
             route.body_len = body.len() as u32;
 
-            let Some(H2Response { body, off, sid_offs }) = h2 else {
+            let Some(H2Response { body, off, sid_offs, data_len }) = h2 else {
                 continue;
             };
             route.h2_body_off = *off as u32;
             route.h2_body_len = body.len() as u32;
             route.h2_sid_offs[..sid_offs.len()].copy_from_slice(sid_offs);
             route.h2_sid_count = sid_offs.len() as u32;
+            route.h2_data_len = *data_len as u32;
         }
 
         // an arena is sized in pages, and only the ones the responses reach are

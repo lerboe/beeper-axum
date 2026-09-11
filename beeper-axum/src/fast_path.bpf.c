@@ -79,7 +79,12 @@ volatile const u32 port;
 #define H2_CONTENT_LENGTH_MID 1
 
 #define H2_SETTINGS_FRAME 0x04
+#define H2_WINDOW_UPDATE_FRAME 0x08
 #define H2_ACK_FLAG 0x01
+
+// The SETTINGS parameter that names the flow control window a stream starts
+// out with, see RFC 7540 section 6.5.2.
+#define H2_SETTINGS_INITIAL_WINDOW_SIZE 0x04
 
 // how far along an upgraded connection is. only once the handshake completed
 // can the fast path answer on it without preempting the server's SETTINGS.
@@ -151,6 +156,63 @@ struct {
     __type(value, struct dt_sync_buf);
 } dt_sync_scratch SEC(".maps");
 
+// The frame type the fast path reports the bytes it answered with to user
+// space under.
+//
+// 0xFB's neighbour, and unassigned for the same reason. It is picked out of the
+// stream by the same wrapper, see `listener.rs`.
+#define FC_SYNC_FRAME_TYPE 0xFA
+
+// The connection level flow control window an HTTP/2 connection opens with,
+// see RFC 7540 section 6.9.2. SETTINGS cannot change it, only WINDOW_UPDATE
+// can, which is what makes it something the fast path can follow on its own.
+#define H2_INITIAL_WINDOW 65535
+
+// The largest window either side may open, see RFC 7540 section 6.9.1.
+#define H2_MAX_WINDOW 0x7FFFFFFF
+
+// The most SETTINGS parameters the fast path reads out of one frame, and how
+// many bytes each of them takes up.
+#define MAX_SETTINGS 16
+#define H2_SETTING_LEN 6
+
+// How much of a connection's flow control the fast path may spend.
+//
+// Only what the client announces is tracked here, as that is all the fast path
+// gets to see: it runs on the client's socket, so every SETTINGS and
+// WINDOW_UPDATE the client sends passes through it, while the server's own
+// responses go out on a socket it never observes. Those responses spend the
+// connection window too, which is what `unreported` is for -- user space is
+// handed the fast path's share and takes it out of its own accounting, see
+// `prepend_fc_sync`.
+//
+// The reverse does not hold: what the server sends never reaches `conn_window`,
+// so it runs ahead of the window the client really has open by exactly the
+// bytes the server has sent since the last WINDOW_UPDATE. Closing that would
+// take a report in the other direction, which is a channel the fast path does
+// not have.
+struct h2_flow {
+    // what is left of the connection level window. it can go negative if the
+    // client shrinks a window it had already opened.
+    s32 conn_window;
+
+    // the window a stream opens with, i.e. the client's
+    // SETTINGS_INITIAL_WINDOW_SIZE. every stream the fast path answers on is
+    // fresh, so this is the whole of its stream window.
+    u32 stream_window;
+
+    // bytes the fast path has sent that user space has not been told about
+    // yet, and so still believes it may spend itself
+    u32 unreported;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct ip4_conn);
+    __type(value, struct h2_flow);
+} flow_ctl SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARENA);
     __uint(map_flags, BPF_F_MMAPABLE);
@@ -195,6 +257,10 @@ struct route {
     u32 h2_body_len;
     u32 h2_sid_offs[MAX_SID_OFFS];
     u32 h2_sid_count;
+
+    // how much of the h2 rendering is flow controlled, i.e. the DATA payloads
+    // without the frame headers around them
+    u32 h2_data_len;
 };
 
 struct route routes[MAX_ROUTES];
@@ -333,9 +399,12 @@ static __always_inline int prepend_dt_sync(struct sk_msg_md *msg, const struct i
     buf->len = 0;
     if (render_dt_sync(buf, conn, n) < 0) return -1;
 
+    // an empty table is worth handing over too: it says the client dropped
+    // everything it had, and a reader that is still holding those entries has
+    // to be brought down to nothing along with it
     u32 body_len = buf->len;
-    if (body_len == 0 || body_len > MAX_SYNC_BODY) return -1;
-    bpf_clamp_uminmax(body_len, 1, MAX_SYNC_BODY);
+    if (body_len > MAX_SYNC_BODY) return -1;
+    bpf_clamp_uminmax(body_len, 0, MAX_SYNC_BODY);
 
     u32 frame_len = 9 + body_len;
     u32 orig_size = msg->size;
@@ -378,6 +447,106 @@ static __always_inline int prepend_dt_sync(struct sk_msg_md *msg, const struct i
     bpf_debug("dt sync: prepended %u entries (%uB) to a %uB msg", n, frame_len, orig_size);
 
     return frame_len;
+}
+
+// Follows the SETTINGS or WINDOW_UPDATE frame `msg` carries into the flow
+// control the fast path spends from.
+//
+// The payload is read straight off the message, so this invalidates whatever
+// the parser captured out of it. Neither frame carries a request, so there is
+// nothing left to extract from one anyway.
+static __always_inline void track_flow(struct sk_msg_md *msg, const struct ip4_conn *conn, const struct h2_frame *frame) {
+    struct h2_flow *fc = bpf_map_lookup_elem(&flow_ctl, conn);
+    if (!fc) return;
+
+    u32 want = (frame->type == H2_WINDOW_UPDATE_FRAME) ? 13 : 9 + MAX_SETTINGS * H2_SETTING_LEN;
+    if (want > msg->size) want = msg->size;
+    if (bpf_msg_pull_data(msg, 0, want, 0) < 0) return;
+
+    u8 *data = (u8 *)(long)msg->data;
+    u8 *data_end = (u8 *)(long)msg->data_end;
+    if (data + 9 > data_end) return;
+
+    u32 payload_len = ((u32)data[0] << 16) | ((u32)data[1] << 8) | data[2];
+
+    if (frame->type == H2_WINDOW_UPDATE_FRAME) {
+        // a window update for a stream the fast path answered on is worth
+        // nothing: that stream is closed and its window can never be spent
+        // again. only the connection level one carries over.
+        if (frame->sid != 0 || payload_len != 4) return;
+        if (data + 13 > data_end) return;
+
+        // the reserved bit is not part of the increment
+        u32 inc = (((u32)data[9] << 24) | ((u32)data[10] << 16) |
+                   ((u32)data[11] << 8) | data[12]) & H2_MAX_WINDOW;
+
+        s64 window = (s64)fc->conn_window + inc;
+        fc->conn_window = window > H2_MAX_WINDOW ? H2_MAX_WINDOW : (s32)window;
+
+        bpf_trace("flow: connection window is %d", fc->conn_window);
+
+        return;
+    }
+
+    if (frame->flags & H2_ACK_FLAG) return;
+
+    u32 n = payload_len / H2_SETTING_LEN;
+    if (n > MAX_SETTINGS) n = MAX_SETTINGS;
+
+    u32 i;
+    bpf_for(i, 0, n) {
+        u32 j = i;
+        bpf_clamp_uminmax(j, 0, MAX_SETTINGS - 1);
+
+        u8 *p = data + 9 + j * H2_SETTING_LEN;
+        if (p + H2_SETTING_LEN > data_end) return;
+
+        if ((((u16)p[0] << 8) | p[1]) != H2_SETTINGS_INITIAL_WINDOW_SIZE) continue;
+
+        u32 val = ((u32)p[2] << 24) | ((u32)p[3] << 16) | ((u32)p[4] << 8) | p[5];
+        // a window the client cannot legally announce is left to user space to
+        // reject rather than acted on here
+        if (val > H2_MAX_WINDOW) return;
+
+        fc->stream_window = val;
+
+        bpf_trace("flow: stream window is %u", fc->stream_window);
+    }
+}
+
+// Prepends the bytes the fast path has answered with on this connection to
+// `msg`, as a frame of type `FC_SYNC_FRAME_TYPE`, so that user space can take
+// them out of the send window its own codec believes it still has.
+//
+// Returns the number of bytes prepended, or -1 if the frame could not be
+// built, in which case `msg` is left untouched.
+static __always_inline int prepend_fc_sync(struct sk_msg_md *msg, u32 sent) {
+    if (bpf_msg_push_data(msg, 0, 13, 0) < 0) return -1;
+    if (bpf_msg_pull_data(msg, 0, 13, 0) < 0) return -1;
+
+    u8 *data = (u8 *)(long)msg->data;
+    u8 *data_end = (u8 *)(long)msg->data_end;
+    if (data + 13 > data_end) return -1;
+
+    data[0] = 0;
+    data[1] = 0;
+    data[2] = 4;
+    data[3] = FC_SYNC_FRAME_TYPE;
+    data[4] = 0;
+    // the bytes were spent on the connection as a whole, whichever streams
+    // they went out on
+    data[5] = 0;
+    data[6] = 0;
+    data[7] = 0;
+    data[8] = 0;
+    data[9] = (sent >> 24) & 0xFF;
+    data[10] = (sent >> 16) & 0xFF;
+    data[11] = (sent >> 8) & 0xFF;
+    data[12] = sent & 0xFF;
+
+    bpf_debug("flow: reporting %uB served out of band", sent);
+
+    return 13;
 }
 
 // Writes `sid` into the frame header at `off`, where h2 keeps the stream id.
@@ -432,6 +601,24 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
     bool is_h2 = (sid != 0);
     u32 body_len = is_h2 ? r->h2_body_len : r->body_len;
     if (body_len == 0 || body_len > MAX_ROUTE_BODY) return -1;
+
+    // an h2 response goes out in one piece or not at all: the fast path has
+    // nowhere to park what does not fit and no way of being woken when the
+    // client reopens its window. a response the client has no room for is
+    // therefore left to user space, which can wait it out.
+    struct h2_flow *fc = NULL;
+    if (is_h2) {
+        fc = bpf_map_lookup_elem(&flow_ctl, ikey);
+        if (!fc) return -1;
+
+        u32 data_len = r->h2_data_len;
+        if (fc->conn_window < 0 || (u32)fc->conn_window < data_len || fc->stream_window < data_len) {
+            bpf_debug("Not serving request, %uB do not fit the client's window (connection %d, stream %u)",
+                      data_len, fc->conn_window, fc->stream_window);
+
+            return -1;
+        }
+    }
 
     u32 orig_size = msg->size;
 
@@ -491,6 +678,13 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
     if (bpf_msg_redirect_hash(msg, &sock_map, ikey, BPF_F_INGRESS) < 0) return -1;
 
     bpf_msg_apply_bytes(msg, body_len);
+
+    // the client's window is spent now, and so is the server's share of it,
+    // which is what user space has to be told about
+    if (fc) {
+        fc->conn_window -= r->h2_data_len;
+        fc->unreported += r->h2_data_len;
+    }
 
     return 0;
 }
@@ -600,15 +794,20 @@ int msg_verdict(struct sk_msg_md *msg) {
                 bpf_map_update_elem(&upgraded_conns, &ikey, &h2_state, BPF_ANY);
             }
 
-            struct hdr_str content_length = { 0 };
-            if (extract_h2_match(msg, &pres, H2_CONTENT_LENGTH_MID, &content_length) == 0) {
-                bpf_trace("content length: %s", content_length.ptr);
-
-                int res = parse_content_length(&content_length);
-                if (res > 0) msg_len += res;
+            if (frame.type == H2_SETTINGS_FRAME || frame.type == H2_WINDOW_UPDATE_FRAME) {
+                track_flow(msg, &ikey, &frame);
             }
+            else {
+                struct hdr_str content_length = { 0 };
+                if (extract_h2_match(msg, &pres, H2_CONTENT_LENGTH_MID, &content_length) == 0) {
+                    bpf_trace("content length: %s", content_length.ptr);
 
-            path_res = extract_h2_match(msg, &pres, H2_PATH_MID, &path);
+                    int res = parse_content_length(&content_length);
+                    if (res > 0) msg_len += res;
+                }
+
+                path_res = extract_h2_match(msg, &pres, H2_PATH_MID, &path);
+            }
         }
     }
     else {
@@ -620,6 +819,12 @@ int msg_verdict(struct sk_msg_md *msg) {
                 int val = H2_UPGRADED;
                 bpf_map_update_elem(&upgraded_conns, &ikey, &val, BPF_ANY);
                 num_upgraded_conns++;
+
+                struct h2_flow flow = {
+                    .conn_window = H2_INITIAL_WINDOW,
+                    .stream_window = H2_INITIAL_WINDOW,
+                };
+                bpf_map_update_elem(&flow_ctl, &ikey, &flow, BPF_ANY);
 
                 // the H2 preface is 24 bytes long
                 bpf_msg_apply_bytes(msg, 24);
@@ -689,6 +894,27 @@ int msg_verdict(struct sk_msg_md *msg) {
 
         u8 dirty = 0;
         bpf_map_update_elem(&dt_dirty, &ikey, &dirty, BPF_ANY);
+    }
+
+    // and the moment to hand over what the fast path spent of the connection's
+    // window. it goes in front of the dynamic table update, so that user space
+    // has taken the bytes out of its own accounting before it looks at
+    // anything that might have it send more.
+    if (is_h2 && msg_len >= 0) {
+        struct h2_flow *fc = bpf_map_lookup_elem(&flow_ctl, &ikey);
+        if (fc && fc->unreported > 0) {
+            int reported = prepend_fc_sync(msg, fc->unreported);
+            if (reported < 0) {
+                // nothing is lost by leaving it for the next message: the fast
+                // path has already taken the bytes out of its own window, so
+                // it will not overrun the client while user space catches up
+                bpf_warn("Failed to report %uB served out of band", fc->unreported);
+            }
+            else {
+                msg_len += reported;
+                fc->unreported = 0;
+            }
+        }
     }
 
     bpf_msg_apply_bytes(msg, msg_len);
