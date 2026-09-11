@@ -56,6 +56,10 @@ pub struct FastPath<'obj> {
     h1: h1::AttachedParser,
     #[allow(dead_code)]
     h2: h2::AttachedParser,
+    #[allow(dead_code)]
+    h1_skb: h1::AttachedParser,
+    #[allow(dead_code)]
+    h2_skb: h2::AttachedParser,
 }
 
 unsafe impl<'obj> Send for FastPath<'obj> {}
@@ -263,6 +267,7 @@ impl<'obj> FastPath<'obj> {
         let mut open_skel = skel_builder.open(open_obj)?;
         if tracing::event_enabled!(Level::TRACE) {
             open_skel.progs.msg_verdict.set_log_level(1);
+            open_skel.progs.skb_verdict.set_log_level(1);
         }
 
         let ip4 = match address {
@@ -330,8 +335,10 @@ impl<'obj> FastPath<'obj> {
                     .with_context(|| format!("failed to index fastpath route {i}"))?;
             }
         }
-        let sock_map_fd = skel.maps.sock_map.as_fd().as_raw_fd();
-        let prog_fd = skel.progs.msg_verdict.as_fd().as_raw_fd();
+        let msg_sock_map_fd = skel.maps.msg_sock_map.as_fd().as_raw_fd();
+        let skb_sock_map_fd = skel.maps.skb_sock_map.as_fd().as_raw_fd();
+        let msg_prog_fd = skel.progs.msg_verdict.as_fd().as_raw_fd();
+        let skb_prog_fd = skel.progs.skb_verdict.as_fd().as_raw_fd();
 
         let h1 = h1::Parser::new()
             .match_h2_preface()
@@ -340,7 +347,7 @@ impl<'obj> FastPath<'obj> {
             .replace_parse_msg("parse_h1")
             .replace_extract("extract_h1_match")
             .replace_matched("matched_h1")
-            .attach(prog_fd)?;
+            .attach(msg_prog_fd)?;
 
         let h2 = h2::Parser::new()
             .capture_hdr(&beeper::header::PATH)?
@@ -348,7 +355,25 @@ impl<'obj> FastPath<'obj> {
             .replace_parse_msg("parse_h2")
             .replace_extract("extract_h2_match")
             .replace_get_dynamic_table_entry("get_dt_entry")
-            .attach(prog_fd)?;
+            .attach(msg_prog_fd)?;
+
+        // a replacement is attached to one program, so the hook that answers
+        // requests coming off the wire gets parsers of its own. their matches
+        // have to be configured in the same order, as a match is named by the
+        // index it was captured under.
+        let h1_skb = h1::Parser::new()
+            .match_h2_preface()
+            .capture_hdr(&beeper::header::PATH)
+            .capture_hdr(&http::header::CONTENT_LENGTH)
+            .replace_parse_skb("parse_h1_skb")
+            .attach(skb_prog_fd)?;
+
+        let h2_skb = h2::Parser::new()
+            .capture_hdr(&beeper::header::PATH)?
+            .capture_hdr(&http::header::CONTENT_LENGTH)?
+            .replace_parse_skb("parse_h2_skb")
+            .replace_get_dynamic_table_entry("get_dt_entry_skb")
+            .attach(skb_prog_fd)?;
 
         let cgroup_fd = std::fs::OpenOptions::new()
             .read(true)
@@ -357,7 +382,8 @@ impl<'obj> FastPath<'obj> {
             .into_raw_fd();
 
         let sockops = skel.progs.monitor_sockets.attach_cgroup(cgroup_fd)?;
-        skel.progs.msg_verdict.attach_sockmap(sock_map_fd)?;
+        skel.progs.msg_verdict.attach_sockmap(msg_sock_map_fd)?;
+        skel.progs.skb_verdict.attach_sockmap(skb_sock_map_fd)?;
 
         debug!("Server fast path attached");
 
@@ -366,6 +392,8 @@ impl<'obj> FastPath<'obj> {
             skel,
             h1,
             h2,
+            h1_skb,
+            h2_skb,
         })
     }
 }

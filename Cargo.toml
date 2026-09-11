@@ -15,3 +15,4 @@ categories = ["network-programming"]
 
 [patch.crates-io]
 h2 = { path = "../h2" }
+beeper = { path = "/tmp/beeper-test/beeper" }

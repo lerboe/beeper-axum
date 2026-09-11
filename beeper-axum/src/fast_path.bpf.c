@@ -19,13 +19,26 @@ struct {
 } upgraded_conns SEC(".maps");
 u32 num_upgraded_conns = 0;
 
-// The client sockets of the server, i.e. the ones `msg_verdict` runs on.
+// The sockets of a client that shares this host with the server, i.e. the ones
+// `msg_verdict` runs on. Both ends of such a connection are local, so a request
+// can be answered on the sending socket, before it ever reaches the stack.
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKHASH);
     __uint(max_entries, 16384);
     __type(key, struct ip4_conn);
     __type(value, int);
-} sock_map SEC(".maps");
+} msg_sock_map SEC(".maps");
+
+// The sockets the server accepted from a client on another host, i.e. the ones
+// `skb_verdict` runs on. Nothing of such a connection is on a socket of this
+// host before the request has arrived, so the fast path picks it up where it
+// comes off the wire and answers out of the very same socket.
+struct {
+    __uint(type, BPF_MAP_TYPE_SOCKHASH);
+    __uint(max_entries, 16384);
+    __type(key, struct ip4_conn);
+    __type(value, int);
+} skb_sock_map SEC(".maps");
 
 // The address of the server, set by user space before the program is loaded.
 volatile const u32 ip4;
@@ -281,15 +294,19 @@ struct {
     __type(value, u8);
 } route_idx SEC(".maps");
 
-// The functions beeper replaces with an HTTP/1.1 parser.
+// The functions beeper replaces with an HTTP/1.1 parser. Each hook gets a
+// parser of its own, as a replacement is attached to one program.
 BEEPER_MATCHED(matched_h1)
 BEEPER_EXTRACT_MATCH(extract_h1_match)
 BEEPER_H1_PARSE_MSG(parse_h1)
+BEEPER_H1_PARSE_SKB(parse_h1_skb)
 
 // The functions beeper replaces with an HTTP/2 parser.
 BEEPER_EXTRACT_MATCH(extract_h2_match)
 BEEPER_H2_PARSE_MSG(parse_h2)
 BEEPER_H2_GET_DT_ENTRY(get_dt_entry)
+BEEPER_H2_PARSE_SKB(parse_h2_skb)
+BEEPER_H2_GET_DT_ENTRY(get_dt_entry_skb)
 
 // Appends `len` bytes of `src` to `buf`. Returns 0 on success, -1 if the
 // buffer is full.
@@ -346,13 +363,15 @@ static __always_inline int sync_put_byte(struct dt_sync_buf *buf, u8 c) {
 //
 // Returns 0 if the whole table was written, -1 if an entry could not be read or
 // does not fit, in which case `buf` is left incomplete and must be discarded.
-static __always_inline int render_dt_sync(struct dt_sync_buf *buf, const struct ip4_conn *conn, u32 n) {
+static __always_inline int render_dt_sync(struct dt_sync_buf *buf, const struct ip4_conn *conn, u32 n, bool on_skb) {
     u32 i;
     bpf_for(i, 0, n) {
         // the entries to replay are the `n` most recent ones, i.e. HPACK
         // indices 1 through `n`, and the oldest of those has to go first
         u32 idx = STATIC_TABLE_SIZE + (n - i);
-        if (get_dt_entry(conn, idx, &buf->hf) < 0) {
+        int res = on_skb ? get_dt_entry_skb(conn, idx, &buf->hf)
+                         : get_dt_entry(conn, idx, &buf->hf);
+        if (res < 0) {
             bpf_warn("dt sync: entry %u is gone", idx);
             return -1;
         }
@@ -397,7 +416,7 @@ static __always_inline int prepend_dt_sync(struct sk_msg_md *msg, const struct i
     // the frame header is written once the body's length is known, so the body
     // is built up behind it
     buf->len = 0;
-    if (render_dt_sync(buf, conn, n) < 0) return -1;
+    if (render_dt_sync(buf, conn, n, false) < 0) return -1;
 
     // an empty table is worth handing over too: it says the client dropped
     // everything it had, and a reader that is still holding those entries has
@@ -675,7 +694,7 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
         }
     }
 
-    if (bpf_msg_redirect_hash(msg, &sock_map, ikey, BPF_F_INGRESS) < 0) return -1;
+    if (bpf_msg_redirect_hash(msg, &msg_sock_map, ikey, BPF_F_INGRESS) < 0) return -1;
 
     bpf_msg_apply_bytes(msg, body_len);
 
@@ -689,11 +708,9 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
     return 0;
 }
 
-// Looks up the captured request path in `route_idx` and, on a match, serves
-// the pre-rendered response directly from the fast path. Returns 0 if a route
-// was served (the caller should return SK_PASS immediately without further
-// processing `msg`), < 0 otherwise.
-static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_conn *ikey, struct hdr_str *path, u32 sid) {
+// Looks the captured request path up in `route_idx`. Returns the index of the
+// route answering it, or -1 if the fast path has none.
+static __always_inline int lookup_route(const struct hdr_str *path) {
     if (path->len == 0 || path->len > MAX_ROUTE_PATH) return -1;
 
     u32 len = path->len;
@@ -708,7 +725,18 @@ static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_con
         return -1;
     };
 
-    u32 i = *idx;
+    return *idx;
+}
+
+// Looks up the captured request path in `route_idx` and, on a match, serves
+// the pre-rendered response directly from the fast path. Returns 0 if a route
+// was served (the caller should return SK_PASS immediately without further
+// processing `msg`), < 0 otherwise.
+static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_conn *ikey, struct hdr_str *path, u32 sid) {
+    int idx = lookup_route(path);
+    if (idx < 0) return -1;
+
+    u32 i = idx;
     bpf_clamp_uminmax(i, 0, MAX_ROUTES - 1);
 
     return serve_route(msg, ikey, &routes[i], sid);
@@ -922,6 +950,559 @@ int msg_verdict(struct sk_msg_md *msg) {
     return SK_PASS;
 }
 
+// ---------------------------------------------------------------------------
+// The sk_skb side of the fast path.
+//
+// A client on another host has no socket on this one, so there is no message
+// leaving this host to answer and `msg_verdict` never runs for its requests.
+// What does run is a stream verdict on the socket the server accepted, and
+// what it is handed is the sk_buff the request arrived in. The response is
+// written into that very buffer and redirected back out of the same socket.
+// ---------------------------------------------------------------------------
+
+// The most bytes a response may take up to be served on this hook.
+//
+// A verdict answers out of the sk_buff it was handed, and `bpf_skb_change_tail`
+// refuses to grow one past `SKB_MAX_ALLOC`: four pages, less the shared info
+// sitting behind the data. A response larger than that is left to the server,
+// which has the whole of the connection to spread it over.
+#define MAX_SKB_BODY 15000
+
+// Where beeper starts numbering the slots it stores dynamic table entries in.
+// Must stay in sync with `DYNAMIC_TABLE_BASE` of its HTTP/2 parser.
+#define H2_DYNAMIC_TABLE_BASE (STATIC_TABLE_SIZE + 1)
+
+// The name a request path is stored under in the dynamic table. A client adds
+// an `:path` field under the name of the static entry it indexed off, and
+// beeper keeps the static table in plain text.
+#define H2_PATH_NAME ":path"
+#define H2_PATH_NAME_LEN 5
+
+// Scratch space for an entry read out of the dynamic table. The sk_msg hook is
+// handed a pointer into the table itself, which is a map of beeper's that this
+// hook cannot reach, so it copies the entry out instead -- and an entry is far
+// too large for the stack the verifier allows.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct header_field);
+} hdr_scratch SEC(".maps");
+
+// Points `str` at the range the parser captured for the match `idx` in `skb`.
+// Returns 0 on success, -1 if nothing was captured for `idx` or if the range
+// lies outside of the buffer.
+static __always_inline int extract_skb(const struct __sk_buff *skb, const struct parse_res *pres, u8 idx, struct hdr_str *str) {
+    if (idx >= MAX_MATCHES) return -1;
+
+    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    if (m.len == 0 || !m.in_msg) return -1;
+
+    u8 *data = (u8 *)(long)skb->data;
+    u8 *data_end = (u8 *)(long)skb->data_end;
+    if (data + m.idx + m.len > data_end) return -1;
+
+    str->ptr = data + m.idx;
+    str->len = m.len;
+
+    return 0;
+}
+
+// The same for the request path an HTTP/2 parser captured, which the client
+// may have sent as an HPACK index into its dynamic table rather than spelled
+// out. An indexed path is copied out of the table into `hdr_scratch`, which
+// `str` then points into.
+//
+// Resolving an index takes a guess: a match names the slot beeper keeps the
+// entry in, while the only handle this hook has on the table, `get_dt_entry_skb`,
+// counts the HPACK way. The two only line up as long as nothing has been
+// evicted, which holds for a table small enough to be replayed at all (see
+// `MAX_SYNC_ENTRIES`). The guess is checked rather than trusted: an entry that
+// does not turn out to hold a path is one this got wrong, and the request goes
+// to the server untouched.
+//
+// Returns 0 on success, -1 if the path could not be resolved.
+static __always_inline int extract_skb_path(const struct __sk_buff *skb, const struct ip4_conn *conn, const struct parse_res *pres, u32 dt_count, struct hdr_str *str) {
+    struct hdr_match m = pres->ms[H2_PATH_MID & MAX_MATCH_MASK];
+    if (m.len == 0) return -1;
+    if (m.in_msg) return extract_skb(skb, pres, H2_PATH_MID, str);
+
+    // the newest entry sits one slot below the end of the table and is HPACK
+    // index 62, so an entry `k` slots further down is index 62 + k
+    u32 end = H2_DYNAMIC_TABLE_BASE + dt_count;
+    if (m.idx < H2_DYNAMIC_TABLE_BASE || m.idx >= end) return -1;
+
+    u32 hpack = H2_DYNAMIC_TABLE_BASE + (end - 1 - m.idx);
+
+    u32 zero = 0;
+    struct header_field *hf = bpf_map_lookup_elem(&hdr_scratch, &zero);
+    if (!hf) return -1;
+
+    if (get_dt_entry_skb(conn, hpack, hf) < 0) return -1;
+
+    if (hf->key_huff || hf->key_len != H2_PATH_NAME_LEN) return -1;
+
+    static const char name[] = H2_PATH_NAME;
+    u32 i;
+    bpf_for(i, 0, H2_PATH_NAME_LEN) {
+        u32 j = i;
+        bpf_clamp_uminmax(j, 0, H2_PATH_NAME_LEN - 1);
+
+        if (hf->key[j] != name[j]) return -1;
+    }
+
+    u32 len = hf->val_len;
+    if (len == 0 || len > BEEPER_H2_FIELD_MAXLEN) return -1;
+    bpf_clamp_uminmax(len, 1, BEEPER_H2_FIELD_MAXLEN);
+
+    // the value is handed over in whichever form it arrived in, which the
+    // route index holds an entry for either way
+    str->ptr = hf->val;
+    str->len = len;
+
+    return 0;
+}
+
+// Follows the SETTINGS or WINDOW_UPDATE frame `skb` carries into the flow
+// control the fast path spends from, see `track_flow`.
+static __always_inline void track_flow_skb(struct __sk_buff *skb, const struct ip4_conn *conn, const struct h2_frame *frame) {
+    struct h2_flow *fc = bpf_map_lookup_elem(&flow_ctl, conn);
+    if (!fc) return;
+
+    u32 want = (frame->type == H2_WINDOW_UPDATE_FRAME) ? 13 : 9 + MAX_SETTINGS * H2_SETTING_LEN;
+    if (want > skb->len) want = skb->len;
+    if (bpf_skb_pull_data(skb, want) < 0) return;
+
+    u8 *data = (u8 *)(long)skb->data;
+    u8 *data_end = (u8 *)(long)skb->data_end;
+    if (data + 9 > data_end) return;
+
+    u32 payload_len = ((u32)data[0] << 16) | ((u32)data[1] << 8) | data[2];
+
+    if (frame->type == H2_WINDOW_UPDATE_FRAME) {
+        if (frame->sid != 0 || payload_len != 4) return;
+        if (data + 13 > data_end) return;
+
+        u32 inc = (((u32)data[9] << 24) | ((u32)data[10] << 16) |
+                   ((u32)data[11] << 8) | data[12]) & H2_MAX_WINDOW;
+
+        s64 window = (s64)fc->conn_window + inc;
+        fc->conn_window = window > H2_MAX_WINDOW ? H2_MAX_WINDOW : (s32)window;
+
+        bpf_trace("flow: connection window is %d", fc->conn_window);
+
+        return;
+    }
+
+    if (frame->flags & H2_ACK_FLAG) return;
+
+    u32 n = payload_len / H2_SETTING_LEN;
+    if (n > MAX_SETTINGS) n = MAX_SETTINGS;
+
+    u32 i;
+    bpf_for(i, 0, n) {
+        u32 j = i;
+        bpf_clamp_uminmax(j, 0, MAX_SETTINGS - 1);
+
+        u8 *p = data + 9 + j * H2_SETTING_LEN;
+        if (p + H2_SETTING_LEN > data_end) return;
+
+        if ((((u16)p[0] << 8) | p[1]) != H2_SETTINGS_INITIAL_WINDOW_SIZE) continue;
+
+        u32 val = ((u32)p[2] << 24) | ((u32)p[3] << 16) | ((u32)p[4] << 8) | p[5];
+        if (val > H2_MAX_WINDOW) return;
+
+        fc->stream_window = val;
+
+        bpf_trace("flow: stream window is %u", fc->stream_window);
+    }
+}
+
+// Makes room for `len` bytes in front of `skb` and points `data` at them.
+// Returns 0 on success, -1 if the buffer could not be grown.
+static __always_inline int skb_prepend(struct __sk_buff *skb, u32 len, u8 **data, u8 **data_end) {
+    if (bpf_skb_change_head(skb, len, 0) < 0) return -1;
+    if (bpf_skb_pull_data(skb, len) < 0) return -1;
+
+    *data = (u8 *)(long)skb->data;
+    *data_end = (u8 *)(long)skb->data_end;
+
+    return 0;
+}
+
+// Prepends the dynamic table of `skb`'s connection to it, see
+// `prepend_dt_sync`. Returns the number of bytes prepended, or -1 if the frame
+// could not be built, in which case `skb` is left untouched.
+static __always_inline int prepend_dt_sync_skb(struct __sk_buff *skb, const struct ip4_conn *conn, u32 n) {
+    u32 zero = 0;
+    struct dt_sync_buf *buf = bpf_map_lookup_elem(&dt_sync_scratch, &zero);
+    if (!buf) return -1;
+
+    buf->len = 0;
+    if (render_dt_sync(buf, conn, n, true) < 0) return -1;
+
+    u32 body_len = buf->len;
+    if (body_len > MAX_SYNC_BODY) return -1;
+    bpf_clamp_uminmax(body_len, 0, MAX_SYNC_BODY);
+
+    u32 frame_len = 9 + body_len;
+    u32 orig_len = skb->len;
+
+    u8 *data, *data_end;
+    if (skb_prepend(skb, frame_len, &data, &data_end) < 0) return -1;
+    if (data + 9 > data_end) return -1;
+
+    data[0] = (body_len >> 16) & 0xFF;
+    data[1] = (body_len >> 8) & 0xFF;
+    data[2] = body_len & 0xFF;
+    data[3] = DT_SYNC_FRAME_TYPE;
+    data[4] = 0;
+    // the sync frame describes the connection, not a stream
+    data[5] = 0;
+    data[6] = 0;
+    data[7] = 0;
+    data[8] = 0;
+
+    u32 i;
+    bpf_for(i, 0, body_len) {
+        u32 j = i;
+        bpf_clamp_uminmax(j, 0, MAX_SYNC_BODY - 1);
+
+        u8 *p = data + 9 + j;
+        if (p + 1 > data_end) return -1;
+
+        *p = buf->data[j];
+    }
+
+    bpf_debug("dt sync: prepended %u entries (%uB) to a %uB skb", n, frame_len, orig_len);
+
+    return frame_len;
+}
+
+// Prepends what the fast path has answered with on this connection to `skb`,
+// see `prepend_fc_sync`. Returns the number of bytes prepended, or -1 if the
+// frame could not be built, in which case `skb` is left untouched.
+static __always_inline int prepend_fc_sync_skb(struct __sk_buff *skb, u32 sent) {
+    u8 *data, *data_end;
+    if (skb_prepend(skb, 13, &data, &data_end) < 0) return -1;
+    if (data + 13 > data_end) return -1;
+
+    data[0] = 0;
+    data[1] = 0;
+    data[2] = 4;
+    data[3] = FC_SYNC_FRAME_TYPE;
+    data[4] = 0;
+    data[5] = 0;
+    data[6] = 0;
+    data[7] = 0;
+    data[8] = 0;
+    data[9] = (sent >> 24) & 0xFF;
+    data[10] = (sent >> 16) & 0xFF;
+    data[11] = (sent >> 8) & 0xFF;
+    data[12] = sent & 0xFF;
+
+    bpf_debug("flow: reporting %uB served out of band", sent);
+
+    return 13;
+}
+
+// Overwrites `skb` with `r`'s pre-rendered response and redirects it out of the
+// socket it arrived on, which is the one the client is at the other end of.
+// `sid` is the h2 stream to answer on, or 0 to serve the HTTP/1.1 rendering.
+//
+// Returns SK_PASS if the response is on its way, SK_DROP if `skb` had already
+// been overwritten when something went wrong -- passing it on would hand the
+// server a response to parse as a request -- and -1 if nothing was touched and
+// the request is the server's to answer.
+static __always_inline int serve_route_skb(struct __sk_buff *skb, struct ip4_conn *ikey, struct route *r, u32 sid) {
+    bool is_h2 = (sid != 0);
+    u32 body_len = is_h2 ? r->h2_body_len : r->body_len;
+    if (body_len == 0) return -1;
+    if (body_len > MAX_SKB_BODY) {
+        bpf_debug("Not serving request, %uB do not fit an sk_buff", body_len);
+
+        return -1;
+    }
+
+    // an h2 response goes out in one piece or not at all, see `serve_route`
+    struct h2_flow *fc = NULL;
+    if (is_h2) {
+        fc = bpf_map_lookup_elem(&flow_ctl, ikey);
+        if (!fc) return -1;
+
+        u32 data_len = r->h2_data_len;
+        if (fc->conn_window < 0 || (u32)fc->conn_window < data_len || fc->stream_window < data_len) {
+            bpf_debug("Not serving request, %uB do not fit the client's window (connection %d, stream %u)",
+                      data_len, fc->conn_window, fc->stream_window);
+
+            return -1;
+        }
+    }
+
+    // a buffer is one contiguous run of bytes, so unlike a message it is
+    // resized once and then written in a single pass
+    if (bpf_skb_change_tail(skb, body_len, 0) < 0) return -1;
+    if (bpf_skb_pull_data(skb, body_len) < 0) return SK_DROP;
+
+    u8 *data = (u8 *)(long)skb->data;
+    u8 *data_end = (u8 *)(long)skb->data_end;
+
+    u32 body_off = is_h2 ? r->h2_body_off : r->body_off;
+    const u8 __arena *src = arena_at(body_off);
+
+    // a helper cannot write into a buffer, so the copy is spelled out. the
+    // read side needs no bound of its own, as an arena access that lands
+    // outside the arena is caught rather than allowed to wander.
+    //
+    // the offset is clamped rather than left to the bound `body_len` already
+    // carries: a packet offset the verifier cannot place under `MAX_PACKET_OFF`
+    // is one it refuses to hand a range for, and so one nothing can be written
+    // through.
+    u32 k;
+    bpf_for(k, 0, MAX_SKB_BODY) {
+        if (k >= body_len) break;
+
+        u32 i = k;
+        bpf_clamp_uminmax(i, 0, MAX_SKB_BODY - 1);
+
+        u8 *p = data + i;
+        if (p + 1 > data_end) return SK_DROP;
+
+        *p = src[i];
+    }
+
+    // the rendered frames carry a zeroed stream id, the one of the request
+    // this responds to is only known here
+    if (is_h2) {
+        u32 i;
+        bpf_for(i, 0, MAX_SID_OFFS) {
+            if (i >= r->h2_sid_count) break;
+
+            u32 j = i;
+            bpf_clamp_uminmax(j, 0, MAX_SID_OFFS - 1);
+
+            u32 off = r->h2_sid_offs[j];
+            if (off + 4 > body_len) return SK_DROP;
+            bpf_clamp_uminmax(off, 0, MAX_SKB_BODY - 4);
+
+            u8 *p = data + off;
+            if (p + 4 > data_end) return SK_DROP;
+
+            p[0] = (sid >> 24) & 0xFF;
+            p[1] = (sid >> 16) & 0xFF;
+            p[2] = (sid >> 8) & 0xFF;
+            p[3] = sid & 0xFF;
+        }
+    }
+
+    // no ingress flag: the response leaves the socket the way the server's own
+    // would, rather than being turned around into its receive queue
+    if (bpf_sk_redirect_hash(skb, &skb_sock_map, ikey, 0) != SK_PASS) {
+        bpf_error("Failed to redirect a response back to the client");
+
+        return SK_DROP;
+    }
+
+    // the client's window is spent now, and so is the server's share of it,
+    // which is what user space has to be told about
+    if (fc) {
+        fc->conn_window -= r->h2_data_len;
+        fc->unreported += r->h2_data_len;
+    }
+
+    return SK_PASS;
+}
+
+// Looks the captured request path up and, on a match, answers it from the fast
+// path. Returns what `serve_route_skb` returned, or -1 if there is no route for
+// the path.
+static __always_inline int try_serve_route_skb(struct __sk_buff *skb, struct ip4_conn *ikey, struct hdr_str *path, u32 sid) {
+    int idx = lookup_route(path);
+    if (idx < 0) return -1;
+
+    u32 i = idx;
+    bpf_clamp_uminmax(i, 0, MAX_ROUTES - 1);
+
+    return serve_route_skb(skb, ikey, &routes[i], sid);
+}
+
+// Parses the request the buffer carries and serves it from the fast path if it
+// asks for one of the pre-rendered routes. Anything else is passed on to the
+// user space server.
+SEC("sk_skb/stream_verdict")
+int skb_verdict(struct __sk_buff *skb) {
+    // the connection as beeper keys it on this hook, which is what the state
+    // of an upgraded connection has to be looked up under
+    struct ip4_conn ikey = {
+        .local = {
+            .ip4 = skb->local_ip4,
+            .port = skb->local_port
+        },
+        .remote = {
+            .ip4 = skb->remote_ip4,
+            .port = bpf_ntohl(skb->remote_port)
+        }
+    };
+
+    u32 skb_len = skb->len;
+
+    bpf_debug("Processing %dB skb from [%pI4:%u->%pI4:%u]", skb_len, &ikey.remote.ip4, ikey.remote.port, &ikey.local.ip4, ikey.local.port);
+
+    if (skb_len == 0) return SK_PASS;
+
+    // a verdict is handed a buffer whose payload need not be in its linear
+    // part at all, while a parser only ever walks what is, so the buffer is
+    // pulled in whole before anything looks at it
+    if (bpf_skb_pull_data(skb, skb_len) < 0) return SK_PASS;
+
+    int *conn_state = bpf_map_lookup_elem(&upgraded_conns, &ikey);
+    bool is_h2 = (conn_state != NULL);
+    // the map entry may be reallocated by the update below, so keep a copy
+    int h2_state = is_h2 ? *conn_state : 0;
+    int msg_len = -1;
+    struct parse_res pres = { 0 };
+    struct hdr_str path = { 0 };
+    int path_res = -1;
+    u32 sid = 0;
+
+    // whether the two dynamic tables may have drifted apart, and what it takes
+    // to replay the mirrored one if they have
+    bool dt_stale = false;
+    u32 dt_count = 0;
+
+    if (is_h2) {
+        struct h2_frame frame = { 0 };
+        msg_len = parse_h2_skb(skb, &pres, &frame);
+        if (msg_len >= 0) {
+            sid = frame.sid;
+
+            u8 *dirty = bpf_map_lookup_elem(&dt_dirty, &ikey);
+            dt_stale = (dirty != NULL && *dirty != 0);
+
+            dt_count = frame.dt_count_before;
+
+            if (frame.type == H2_SETTINGS_FRAME && (frame.flags & H2_ACK_FLAG) && h2_state < H2_HANDSHAKED) {
+                bpf_trace("HTTP/2 handshake complete");
+
+                h2_state = H2_HANDSHAKED;
+                bpf_map_update_elem(&upgraded_conns, &ikey, &h2_state, BPF_ANY);
+            }
+
+            if (frame.type == H2_SETTINGS_FRAME || frame.type == H2_WINDOW_UPDATE_FRAME) {
+                track_flow_skb(skb, &ikey, &frame);
+            }
+            else {
+                struct hdr_str content_length = { 0 };
+                if (extract_skb(skb, &pres, H2_CONTENT_LENGTH_MID, &content_length) == 0) {
+                    int res = parse_content_length(&content_length);
+                    if (res > 0) msg_len += res;
+                }
+
+                path_res = extract_skb_path(skb, &ikey, &pres, dt_count, &path);
+            }
+        }
+    }
+    else {
+        msg_len = parse_h1_skb(skb, &pres);
+        if (msg_len > 0) {
+            if (pres.ms[H1_PREFACE_MID & MAX_MATCH_MASK].len > 0) {
+                bpf_trace("Upgrading connection to HTTP/2");
+
+                int val = H2_UPGRADED;
+                bpf_map_update_elem(&upgraded_conns, &ikey, &val, BPF_ANY);
+                num_upgraded_conns++;
+
+                struct h2_flow flow = {
+                    .conn_window = H2_INITIAL_WINDOW,
+                    .stream_window = H2_INITIAL_WINDOW,
+                };
+                bpf_map_update_elem(&flow_ctl, &ikey, &flow, BPF_ANY);
+
+                return SK_PASS;
+            }
+
+            struct hdr_str content_length = { 0 };
+            if (extract_skb(skb, &pres, H1_CONTENT_LENGTH_MID, &content_length) == 0) {
+                int res = parse_content_length(&content_length);
+                if (res > 0) msg_len += res;
+            }
+
+            path_res = extract_skb(skb, &pres, H1_PATH_MID, &path);
+        }
+    }
+
+    bpf_debug("XXX parsed: msg_len=%d path_res=%d skb_len=%u", msg_len, path_res, skb_len);
+
+    bool can_serve = (path_res == 0) && (!is_h2 || h2_state >= H2_HANDSHAKED);
+    if (path_res == 0 && !can_serve) {
+        bpf_debug("Not serving request, HTTP/2 handshake is still in flight");
+    }
+
+    // answering means overwriting the buffer, so whatever else it holds would
+    // go down with the request. a verdict has no way of holding part of a
+    // buffer back -- there are no bytes to apply a verdict to as there are on
+    // a message -- so a request sharing its buffer is left to the server.
+    if (can_serve && msg_len != skb_len) {
+        bpf_debug("Not serving request, it covers %d of the %uB in the buffer", msg_len, skb_len);
+        can_serve = false;
+    }
+
+    // a table too large to replay cannot be handed over, so answering here
+    // would strand user space for good
+    if (can_serve && dt_count > MAX_SYNC_ENTRIES) {
+        bpf_warn("Not serving request, the dynamic table holds %u entries", dt_count);
+        can_serve = false;
+    }
+
+    if (can_serve) {
+        int res = try_serve_route_skb(skb, &ikey, &path, sid);
+        if (res >= 0) {
+            if (res == SK_PASS) {
+                bpf_debug("Served request");
+
+                // user space knows nothing of this request, and the header
+                // block just decoded may well have changed the dynamic table,
+                // so the next message it does get has to carry the table with it
+                if (is_h2) {
+                    u8 dirty = 1;
+                    bpf_map_update_elem(&dt_dirty, &ikey, &dirty, BPF_ANY);
+                }
+            }
+
+            return res;
+        }
+    }
+
+    // the request is going to user space, so this is the moment to hand the
+    // dynamic table over, see `msg_verdict`
+    if (is_h2 && msg_len >= 0 && dt_stale) {
+        if (prepend_dt_sync_skb(skb, &ikey, dt_count) < 0) {
+            bpf_error("Failed to sync dynamic table, dropping connection");
+
+            return SK_DROP;
+        }
+
+        u8 dirty = 0;
+        bpf_map_update_elem(&dt_dirty, &ikey, &dirty, BPF_ANY);
+    }
+
+    // and the moment to hand over what the fast path spent of the connection's
+    // window
+    if (is_h2 && msg_len >= 0) {
+        struct h2_flow *fc = bpf_map_lookup_elem(&flow_ctl, &ikey);
+        if (fc && fc->unreported > 0) {
+            if (prepend_fc_sync_skb(skb, fc->unreported) < 0) {
+                bpf_warn("Failed to report %uB served out of band", fc->unreported);
+            }
+            else {
+                fc->unreported = 0;
+            }
+        }
+    }
+
+    return SK_PASS;
+}
+
 SEC("sockops")
 int monitor_sockets(struct bpf_sock_ops *ops) {
     if (ops->op == BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB || ops->op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
@@ -941,13 +1522,27 @@ int monitor_sockets(struct bpf_sock_ops *ops) {
 
         bpf_debug("Established socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
 
-        if (skey.remote.ip4 == ip4 && skey.remote.port == port) {
-            if (bpf_sock_hash_update(ops, &sock_map, &skey, BPF_ANY) < 0) {
+        // which hook can answer on a connection is decided by where its two
+        // ends are. a client sharing this host with the server has a socket of
+        // its own here, and its requests are answered as they leave it, before
+        // the stack ever carries them. a client on another host has none, so
+        // the request is picked up on the socket the server accepted, where it
+        // arrives off the wire.
+        bool is_local = skey.local.ip4 == skey.remote.ip4;
+        bool is_client = (skey.remote.ip4 == ip4 || ip4 == 0) && skey.remote.port == port;
+        bool is_server = (skey.local.ip4 == ip4 || ip4 == 0) && skey.local.port == port;
+
+        void *map = NULL;
+        if (is_local && is_client) map = &msg_sock_map;
+        else if (!is_local && is_server) map = &skb_sock_map;
+
+        if (map) {
+            if (bpf_sock_hash_update(ops, map, &skey, BPF_ANY) < 0) {
                 bpf_error("Failed to add socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
                 return SK_PASS;
             }
 
-            bpf_debug("Add socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
+            bpf_debug("Add %s socket [%pI4:%u->%pI4:%u]", is_local ? "local" : "remote", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
         }
     }
 
