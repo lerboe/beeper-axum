@@ -572,6 +572,11 @@ static __always_inline int write_sid(struct sk_msg_md *msg, u32 off, u32 sid) {
     return 0;
 }
 
+// How many bytes one turn of the copy loop moves. A byte at a time spends an
+// iterator step and a bounds check on every single one of them; a block spends
+// them once and moves eight bytes at a time underneath.
+#define COPY_BLOCK 64
+
 // Copies `len` bytes of `src` into the message window that `bpf_msg_pull_data`
 // last made addressable. Returns 0 on success, < 0 if the window is short.
 static __always_inline int copy_chunk(struct sk_msg_md *msg, const u8 __arena *src, u32 len) {
@@ -582,12 +587,48 @@ static __always_inline int copy_chunk(struct sk_msg_md *msg, const u8 __arena *s
     // bounds it, the packet check is what the verifier goes by. the read side
     // needs no bound of its own, as an arena access that lands outside the
     // arena is caught rather than allowed to wander.
-    u32 k;
-    bpf_for(k, 0, CHUNK) {
-        if (k >= len) break;
-        if (data + k + 1 > data_end) return -1;
+    u32 done = 0;
 
-        data[k] = src[k];
+    u32 b;
+    bpf_for(b, 0, CHUNK / COPY_BLOCK) {
+        u32 off = b * COPY_BLOCK;
+        if (off + COPY_BLOCK > len) break;
+
+        // the check has to name the pointer the stores are reached through for
+        // the verifier to carry its range over to them, so the block's start is
+        // taken once and everything below hangs off it
+        u8 *dst = data + off;
+        if (dst + COPY_BLOCK > data_end) return -1;
+
+        // widening the read needs a pointer of the wider type, and clang drops
+        // the arena address space on its way through the cast, leaving a load
+        // the verifier reads as one off a plain scalar. the barrier is what
+        // stops it folding the two together, and so what keeps the cast.
+        const u8 __arena *p = src + off;
+        asm volatile("" : "+r"(p));
+
+        // neither side is aligned to eight: responses sit back to back in the
+        // arena, and a window starts wherever the message put it. the verifier
+        // only holds unaligned access against a target that pays for it, which
+        // x86 and arm64 do not.
+        const u64 __arena *words = (const u64 __arena *)p;
+
+#pragma unroll
+        for (u32 w = 0; w < COPY_BLOCK / 8; w++) {
+            *(u64 *)(dst + w * 8) = words[w];
+        }
+
+        done = off + COPY_BLOCK;
+    }
+
+    // whatever the last whole block left behind, which is shorter than one
+    u32 k;
+    bpf_for(k, 0, COPY_BLOCK) {
+        u32 off = done + k;
+        if (off >= len) break;
+        if (data + off + 1 > data_end) return -1;
+
+        data[off] = src[off];
     }
 
     return 0;

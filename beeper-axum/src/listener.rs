@@ -488,6 +488,8 @@ impl BeeperListener {
     pub async fn accept(&self) -> io::Result<(BeeperStream, SocketAddr)> {
         let (stream, addr) = self.inner.accept().await?;
 
+        stream.set_nodelay(true)?;
+
         let stream = BeeperStream {
             inner: stream,
             scanner: Scanner::new(SyncHandle::default(), FlowHandle::default()),
