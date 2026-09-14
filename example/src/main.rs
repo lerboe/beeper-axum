@@ -1,8 +1,8 @@
 //! A static file server whose requests can be answered from the kernel.
 
 use axum::http::StatusCode;
-use clap::Parser;
 use beeper_axum::{OpenObject, fast_path::FastPath, listener::BeeperListener, server};
+use clap::Parser;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tower_http::{
@@ -27,19 +27,13 @@ struct Args {
 
 /// All assets that are served with the fast path.
 fn fastpath_routes(assets_dir: &str) -> HashMap<String, PathBuf> {
-    [
-        "/style.css",
-        "/script.js",
-        "/honeycomb.png",
-        "/rings.png",
-        "/stripes.png",
-    ]
-    .into_iter()
-    .map(|path| {
-        let file = PathBuf::from(format!("{assets_dir}{path}"));
-        (path.to_string(), file)
-    })
-    .collect()
+    ["/1KB.txt", "/8KB.txt", "/32KB.txt", "/128KB.txt"]
+        .into_iter()
+        .map(|path| {
+            let file = PathBuf::from(format!("{assets_dir}{path}"));
+            (path.to_string(), file)
+        })
+        .collect()
 }
 
 #[tokio::main]

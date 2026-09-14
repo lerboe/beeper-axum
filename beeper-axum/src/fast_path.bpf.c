@@ -575,7 +575,7 @@ static __always_inline int write_sid(struct sk_msg_md *msg, u32 off, u32 sid) {
 // How many bytes one turn of the copy loop moves. A byte at a time spends an
 // iterator step and a bounds check on every single one of them; a block spends
 // them once and moves eight bytes at a time underneath.
-#define COPY_BLOCK 64
+#define COPY_BLOCK 256
 
 // Copies `len` bytes of `src` into the message window that `bpf_msg_pull_data`
 // last made addressable. Returns 0 on success, < 0 if the window is short.
