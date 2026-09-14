@@ -6,16 +6,6 @@ COLOR_GREEN='\033[0;32m'
 COLOR_YELLOW='\033[0;33m'
 COLOR_OFF='\033[0m' # No Color
 
-WORKSPACE=$(dirname "$(readlink -f "$0")")/..
-
-RES_DIR=$WORKSPACE/res
-NAME=run
-
-if [[ $(ulimit -n) -lt 10000 ]]; then
-    echo -e "${COLOR_RED}Low open files limit ($(ulimit -n)). Please increase and try again.${COLOR_OFF}"
-    exit 1
-fi
-
 while getopts "n:" opt; do
     case $opt in
         n ) NAME=${OPTARG} ;;
@@ -26,7 +16,14 @@ while getopts "n:" opt; do
     esac
 done
 
+WORKSPACE=$(dirname "$(readlink -f "$0")")/..
+RES_DIR=$WORKSPACE/res
 OUT_DIR=$RES_DIR/$NAME
+
+if [[ $(ulimit -n) -lt 10000 ]]; then
+    echo -e "${COLOR_RED}Low open files limit ($(ulimit -n)). Please increase and try again.${COLOR_OFF}"
+    exit 1
+fi
 
 function cpu_governor {
     echo -e "${COLOR_YELLOW}Set CPU governor: $1${COLOR_OFF}"
@@ -61,7 +58,7 @@ cargo b -r --bin example
 TESTS=(bl fp sp)
 PROTOS=("" --http2)
 QPS=(2000 4000 6000 8000 10000 12000 14000 16000 18000 20000)
-FILE_SIZES=(128KB)
+FILE_SIZES=(8KB 16KB 32KB 48KB 64KB)
 
 mkdir -p "$OUT_DIR"
 cpu_governor "performance"
@@ -77,8 +74,6 @@ for test in "${TESTS[@]}"; do
     for proto in "${PROTOS[@]}"; do
         for size in "${FILE_SIZES[@]}"; do
             for qps in "${QPS[@]}"; do
-                [[ $proto == --http2 && $qps -gt 8000 ]] && continue
-
                 log=$OUT_DIR/$test${proto:+-http2}-${size}-${qps}.log
                 req=http://127.0.0.1:8080/${size}${SUFFIX}.txt
 

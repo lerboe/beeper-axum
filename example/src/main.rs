@@ -22,13 +22,21 @@ struct Args {
 
 /// All assets that are served with the fast path.
 fn fastpath_routes(assets_dir: &str) -> HashMap<String, PathBuf> {
-    ["/1KB.txt", "/8KB.txt", "/32KB.txt", "/128KB.txt"]
-        .into_iter()
-        .map(|path| {
-            let file = PathBuf::from(format!("{assets_dir}{path}"));
-            (path.to_string(), file)
-        })
-        .collect()
+    [
+        "/1KB.txt",
+        "/8KB.txt",
+        "/16KB.txt",
+        "/32KB.txt",
+        "/48KB.txt",
+        "/64KB.txt",
+        "/128KB.txt",
+    ]
+    .into_iter()
+    .map(|path| {
+        let file = PathBuf::from(format!("{assets_dir}{path}"));
+        (path.to_string(), file)
+    })
+    .collect()
 }
 
 #[tokio::main]
