@@ -1,15 +1,10 @@
 //! A static file server whose requests can be answered from the kernel.
 
-use axum::http::StatusCode;
 use beeper_axum::{OpenObject, fast_path::FastPath, listener::BeeperListener, server};
 use clap::Parser;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    set_status::SetStatus,
-    trace::TraceLayer,
-};
+use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// A static file server that can answer its smaller assets from eBPF.
@@ -54,11 +49,7 @@ async fn main() {
         .init();
 
     let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
-    let index_html = SetStatus::new(
-        ServeFile::new(format!("{assets_dir}/index.html")),
-        StatusCode::NOT_FOUND,
-    );
-    let serve_dir = ServeDir::new(assets_dir).not_found_service(index_html);
+    let serve_dir = ServeDir::new(assets_dir);
 
     let app = axum::Router::new()
         .fallback_service(serve_dir)
